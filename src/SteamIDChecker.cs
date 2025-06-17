@@ -17,333 +17,155 @@ using System.Net;
 using System.Text;
 using System.Xml.Linq;
 
-partial class SteamIDChecker
+class SteamIDChecker
 {
     private static readonly HttpClient client = new();
     private static int requestCount = 0;
-    private static DateTime lastRequestTime = DateTime.Now;
-    private static readonly object lockObj = new();
-    private static StreamWriter? logWriter;
-    private static string? logFilePath;
-
+    
     static async Task Main(string[] args)
     {
-        try
-        {
-            bool checkThreeLetterCombinations = args.Length > 0 && args[0] == "-3";
+        int length = GetLength(args);
+        var logFile = CreateLogFile(length);
+        
+        WriteColorLine($"Steam ID Checker - Checking {length} character combinations", ConsoleColor.Cyan);
+        WriteColorLine($"Results saved to: {logFile}", ConsoleColor.Gray);
 
-            string executableDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".";
-            string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-            string letterCount = checkThreeLetterCombinations ? "3letter" : "2letter";
-            logFilePath = Path.Combine(executableDir, $"steam_ids_{letterCount}_{timestamp}.txt");
+        client.DefaultRequestHeaders.Add("User-Agent", 
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+        client.Timeout = TimeSpan.FromSeconds(10);
 
-            logWriter = new StreamWriter(logFilePath, false, Encoding.UTF8);
-            await logWriter.WriteLineAsync($"Steam ID Checker Results - {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            await logWriter.WriteLineAsync($"Checking {(checkThreeLetterCombinations ? "3 letter" : "2 letter")} combinations");
-            await logWriter.WriteLineAsync("=" + new string('=', 50));
-            await logWriter.FlushAsync();
+        int count = 0, free = 0;
+        var start = DateTime.Now;
 
-            var combinations = GenerateCombinations(checkThreeLetterCombinations);
-            int totalCombinations = checkThreeLetterCombinations ? 46656 : 1296;
+        using var writer = new StreamWriter(logFile, false, Encoding.UTF8);
+        await writer.WriteLineAsync($"Steam ID Check Results - {DateTime.Now}");
+        await writer.WriteLineAsync($"Length: {length} characters\n");
 
-            Console.WriteLine($"Steam ID Checker - {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            Console.WriteLine($"Checking {(checkThreeLetterCombinations ? "3 letter" : "2 letter")} Steam IDs...");
-            Console.WriteLine($"Total combinations to check: {totalCombinations:N0}");
-            Console.WriteLine($"Results will be saved to: {logFilePath}");
-            Console.WriteLine("Press Ctrl+C to stop at any time.");
-            Console.WriteLine("Starting check...\n");
-
-            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
-            client.Timeout = TimeSpan.FromSeconds(30);
-
-            int checkedCount = 0;
-            int free = 0;
-            int taken = 0;
-            var startTime = DateTime.Now;
-
-            foreach (var id in combinations)
-            {
-                try
-                {
-                    var result = await CheckSteamID(id);
-                    checkedCount++;
-
-                    string status = result.IsFree ? "Free" : "Taken";
-                    string colorStatus = result.IsFree ? "\u001b[32mFree\u001b[0m" : "\u001b[91mTaken\u001b[0m";
-
-                    Console.WriteLine($"{id} - {colorStatus}");
-
-                    await logWriter.WriteLineAsync($"{id} - {status}");
-
-                    if (result.IsFree)
-                    {
-                        free++;
-                        Console.WriteLine($"  -> FREE ID FOUND: {id}");
-                    }
-                    else taken++;
-
-                    if (checkedCount % 10 == 0)
-                    {
-                        await logWriter.FlushAsync();
-                    }
-
-                    if (checkedCount % 50 == 0)
-                    {
-                        var elapsed = DateTime.Now - startTime;
-                        var rate = checkedCount / elapsed.TotalMinutes;
-                        var remaining = totalCombinations - checkedCount;
-                        var eta = remaining / rate;
-
-                        string progressLine = $"--- Progress: {checkedCount:N0}/{totalCombinations:N0} ({checkedCount * 100.0 / totalCombinations:F1}%) ---";
-                        string statsLine = $"Free: {free:N0} | Taken: {taken:N0} | Rate: {rate:F1}/min | ETA: {eta:F0} min";
-
-                        Console.WriteLine($"\n{progressLine}");
-                        Console.WriteLine($"{statsLine}\n");
-
-                        await logWriter.WriteLineAsync($"\n{progressLine}");
-                        await logWriter.WriteLineAsync($"{statsLine}\n");
-                        await logWriter.FlushAsync();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"{id} - \u001b[93mError: {ex.Message}\u001b[0m");
-                    await logWriter.WriteLineAsync($"{id} - Error: {ex.Message}");
-                }
-            }
-
-            var totalTime = DateTime.Now - startTime;
-            string completionSummary = $@"
-=== COMPLETED ===
-Total checked: {checkedCount:N0}
-Free IDs found: {free:N0}
-Taken IDs: {taken:N0}
-Total time: {totalTime:hh\:mm\:ss}
-Average rate: {checkedCount / totalTime.TotalMinutes:F1} checks/minute
-Completed at: {DateTime.Now:yyyy-MM-dd HH:mm:ss}";
-
-            Console.WriteLine(completionSummary);
-            await logWriter.WriteLineAsync(completionSummary);
-            await logWriter.FlushAsync();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Fatal error: {ex.Message}");
-            if (logWriter != null)
-            {
-                await logWriter.WriteLineAsync($"Fatal error: {ex.Message}");
-            }
-        }
-        finally
-        {
-            if (logWriter != null)
-            {
-                await logWriter.FlushAsync();
-                logWriter.Close();
-                logWriter.Dispose();
-            }
-            client?.Dispose();
-            Console.WriteLine($"\nResults saved to: {logFilePath}");
-            Console.WriteLine("Press any key to exit...");
-            Console.ReadKey();
-        }
-    }
-
-    static async Task<(bool IsFree, string Response)> CheckSteamID(string id)
-    {
-        const int maxRetries = 5;
-        int retryCount = 0;
-
-        while (retryCount < maxRetries)
+        foreach (var id in GenerateIds(length))
         {
             try
             {
-                await EnforceRateLimit();
+                bool isFree = await CheckId(id);
+                count++;
 
-                string url = $"https://steamcommunity.com/id/{id}/?xml=1";
+                string status = isFree ? "FREE" : "TAKEN";
+                ConsoleColor color = isFree ? ConsoleColor.Green : ConsoleColor.Red;
+                
+                WriteColor($"{id} - ", ConsoleColor.White);
+                WriteColorLine(status, color);
+                await writer.WriteLineAsync($"{id} - {status}");
 
-                lock (lockObj)
+                if (isFree) free++;
+
+                if (count % 100 == 0)
                 {
-                    requestCount++;
-                    lastRequestTime = DateTime.Now;
+                    var elapsed = DateTime.Now - start;
+                    var rate = count / elapsed.TotalMinutes;
+                    WriteColorLine($"Progress: {count:N0} checked, {free} free, {rate:F0}/min\n", ConsoleColor.Yellow);
+                    await writer.FlushAsync();
                 }
-
-                var response = await client.GetAsync(url);
-                var content = await response.Content.ReadAsStringAsync();
-
-                if (IsRateLimited(response, content))
-                {
-                    var waitTime = GetWaitTimeFromHeaders(response) ?? TimeSpan.FromMinutes(1);
-                    Console.WriteLine($"\u001b[93mRate limited (HTTP {(int)response.StatusCode})! Waiting {waitTime.TotalSeconds:F0} seconds...\u001b[0m");
-                    await Task.Delay(waitTime);
-                    retryCount++;
-                    continue;
-                }
-
-                if (!response.IsSuccessStatusCode && !IsRateLimited(response, content))
-                {
-                    if (retryCount < maxRetries - 1)
-                    {
-                        Console.WriteLine($"\u001b[93mHTTP {(int)response.StatusCode} for {id}, retrying...\u001b[0m");
-                        await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, retryCount)));
-                        retryCount++;
-                        continue;
-                    }
-                    throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {response.ReasonPhrase}");
-                }
-
-                bool isFree = IsProfileNotFound(content);
-                return (isFree, content);
             }
-            catch (TaskCanceledException)
+            catch (Exception ex)
             {
-                if (retryCount < maxRetries - 1)
-                {
-                    Console.WriteLine($"\u001b[93mTimeout for {id}, retrying...\u001b[0m");
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, retryCount)));
-                    retryCount++;
-                    continue;
-                }
-                throw new TimeoutException($"Request timed out for {id}");
-            }
-            catch (HttpRequestException ex)
-            {
-                if (retryCount < maxRetries - 1)
-                {
-                    Console.WriteLine($"\u001b[93mNetwork error for {id}, retrying...\u001b[0m");
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, retryCount)));
-                    retryCount++;
-                    continue;
-                }
-                throw;
+                WriteColor($"{id} - ", ConsoleColor.White);
+                WriteColorLine($"ERROR: {ex.Message}", ConsoleColor.Magenta);
             }
         }
 
-        throw new Exception($"Failed to check {id} after {maxRetries} attempts");
+        var total = DateTime.Now - start;
+        string summary = $"\nCompleted: {count:N0} checked, {free} free IDs found in {total:hh\\:mm\\:ss}";
+        WriteColorLine(summary, ConsoleColor.Cyan);
+        await writer.WriteLineAsync(summary);
     }
 
-    static async Task EnforceRateLimit()
+    static void WriteColor(string text, ConsoleColor color)
     {
-        lock (lockObj)
-        {
-            var timeSinceLastRequest = DateTime.Now - lastRequestTime;
-            var minInterval = TimeSpan.FromMilliseconds(250);
-
-            if (timeSinceLastRequest < minInterval)
-            {
-                var waitTime = minInterval - timeSinceLastRequest;
-                Task.Delay(waitTime).Wait();
-            }
-        }
-
-        if (requestCount > 100)
-        {
-            Console.WriteLine("\u001b[96mTaking a longer break to be nice to valve servers...\u001b[0m");
-            await Task.Delay(TimeSpan.FromSeconds(15));
-            lock (lockObj)
-            {
-                requestCount = 0;
-            }
-        }
+        var originalColor = Console.ForegroundColor;
+        Console.ForegroundColor = color;
+        Console.Write(text);
+        Console.ForegroundColor = originalColor;
     }
 
-    static bool IsRateLimited(HttpResponseMessage response, string content)
+    static void WriteColorLine(string text, ConsoleColor color)
     {
-        var rateLimitStatusCodes = new[]
-        {
-            HttpStatusCode.TooManyRequests,
-            HttpStatusCode.ServiceUnavailable,
-            HttpStatusCode.NotFound,
-            HttpStatusCode.Forbidden,
-            HttpStatusCode.MethodNotAllowed,
-            HttpStatusCode.BadGateway,
-            HttpStatusCode.GatewayTimeout
-        };
-
-        if (rateLimitStatusCodes.Contains(response.StatusCode))
-        {
-            return true;
-        }
-
-        if (!string.IsNullOrEmpty(content))
-        {
-            var rateLimitKeywords = new[]
-            {
-                "rate limit",
-                "too many requests",
-                "temporarily unavailable",
-                "service unavailable",
-                "try again later",
-                "throttled"
-            };
-
-            return rateLimitKeywords.Any(keyword =>
-                content.Contains(keyword, StringComparison.OrdinalIgnoreCase));
-        }
-
-        return false;
+        var originalColor = Console.ForegroundColor;
+        Console.ForegroundColor = color;
+        Console.WriteLine(text);
+        Console.ForegroundColor = originalColor;
     }
 
-    static TimeSpan? GetWaitTimeFromHeaders(HttpResponseMessage response)
+    static int GetLength(string[] args)
     {
-        if (response.Headers.RetryAfter != null)
+        if (args.Length > 0 && args[0].StartsWith("-") && 
+            int.TryParse(args[0][1..], out int length) && 
+            length >= 1 && length <= 8)
         {
-            if (response.Headers.RetryAfter.Delta.HasValue)
-                return response.Headers.RetryAfter.Delta.Value;
-
-            if (response.Headers.RetryAfter.Date.HasValue)
-                return response.Headers.RetryAfter.Date.Value - DateTimeOffset.Now;
+            return length;
         }
-
-        return null;
+        return 2;
     }
 
-    static IEnumerable<string> GenerateCombinations(bool checkThreeLetterCombinations)
+    static string CreateLogFile(int length)
     {
-        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        string dir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".";
+        string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+        return Path.Combine(dir, $"steam_ids_{length}char_{timestamp}.txt");
+    }
 
-        if (checkThreeLetterCombinations)
-        {
-            foreach (char first in chars)
-            {
-                foreach (char second in chars)
-                {
-                    foreach (char third in chars)
-                    {
-                        yield return $"{first}{second}{third}";
-                    }
-                }
-            }
-        }
+    static IEnumerable<string> GenerateIds(int length)
+    {
+        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        return Generate("", length, chars);
+    }
+
+    static IEnumerable<string> Generate(string prefix, int remaining, string chars)
+    {
+        if (remaining == 0)
+            yield return prefix;
         else
+            foreach (char c in chars)
+                foreach (string id in Generate(prefix + c, remaining - 1, chars))
+                    yield return id;
+    }
+
+    static async Task<bool> CheckId(string id)
+    {
+        await RateLimit();
+
+        var response = await client.GetAsync($"https://steamcommunity.com/id/{id}/?xml=1");
+        var content = await response.Content.ReadAsStringAsync();
+
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
         {
-            foreach (char first in chars)
-            {
-                foreach (char second in chars)
-                {
-                    yield return $"{first}{second}";
-                }
-            }
+            WriteColorLine("Rate limited - waiting 30s...", ConsoleColor.DarkYellow);
+            await Task.Delay(30000);
+            return await CheckId(id);
+        }
+
+        return IsNotFound(content);
+    }
+
+    static async Task RateLimit()
+    {
+        await Task.Delay(50);
+        
+        requestCount++;
+        if (requestCount % 50 == 0)
+        {
+            WriteColorLine("Taking break...", ConsoleColor.DarkGray);
+            await Task.Delay(5000);
         }
     }
 
-    static bool IsProfileNotFound(string response)
+    static bool IsNotFound(string xml)
     {
         try
         {
-            var xml = XDocument.Parse(response);
-            var errorElement = xml.Root?.Element("error");
-
-            if (errorElement != null)
-            {
-                string errorText = errorElement.Value;
-                return errorText.Contains("The specified profile could not be found") ||
-                       errorText.Contains("No profile exists");
-            }
-
-            return false;
+            var doc = XDocument.Parse(xml);
+            var error = doc.Root?.Element("error")?.Value;
+            return error?.Contains("could not be found") == true;
         }
-        catch (Exception)
+        catch
         {
             return false;
         }
