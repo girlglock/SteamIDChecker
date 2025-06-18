@@ -20,9 +20,13 @@ class SteamIDChecker
 {
     private static readonly HttpClient client = new();
     private static int requestCount = 0;
+    private static int completedCount = 0;
+    private static int freeCount = 0;
     private static readonly object lockObject = new();
+    private static readonly object statsLock = new();
     private static DateTime lastRateLimitTime = DateTime.MinValue;
     private static readonly object rateLimitLock = new();
+    private static readonly SemaphoreSlim concurrencySemaphore = new(10, 10);
 
     static async Task Main(string[] args)
     {
@@ -30,7 +34,7 @@ class SteamIDChecker
         string startFrom = GetStartFrom(args);
         var logFile = CreateLogFile(length, startFrom);
 
-        WriteColorLine($"steam ID Checker - Checking {length} combinations", ConsoleColor.Cyan);
+        WriteColorLine($"steam ID Checker - Checking {length} combinations (10 concurrent)", ConsoleColor.Cyan);
         if (!string.IsNullOrEmpty(startFrom))
             WriteColorLine($"starting from: {startFrom}", ConsoleColor.Yellow);
         WriteColorLine($"results will be saved to: {logFile}", ConsoleColor.Gray);
@@ -39,7 +43,6 @@ class SteamIDChecker
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
         client.Timeout = TimeSpan.FromSeconds(15);
 
-        int count = 0, free = 0;
         var start = DateTime.Now;
 
         using var writer = new StreamWriter(logFile, false, Encoding.UTF8);
@@ -52,68 +55,97 @@ class SteamIDChecker
         var allIds = GenerateIds(length, startFrom).ToList();
         int totalIds = allIds.Count;
 
-        foreach (var id in allIds)
+        var progressTask = Task.Run(async () =>
         {
-            try
+            while (completedCount < totalIds)
             {
-                bool isFree = await CheckId(id);
-                count++;
+                await Task.Delay(5000);
+                
+                if (completedCount > 0)
+                {
+                    var elapsed = DateTime.Now - start;
+                    var rate = completedCount / elapsed.TotalMinutes;
+                    var remaining = totalIds - completedCount;
+                    var estimatedMinutesLeft = remaining / Math.Max(rate, 1);
+                    var estimatedTimeLeft = TimeSpan.FromMinutes(estimatedMinutesLeft);
 
-                string status = isFree ? "FREE" : "TAKEN";
-                ConsoleColor color = isFree ? ConsoleColor.Green : ConsoleColor.Red;
-
-                WriteColor($"{id} - ", ConsoleColor.White);
-                WriteColorLine(status, color);
-                await writer.WriteLineAsync($"{id} - {status}");
-
-                if (isFree) free++;
+                    WriteColorLine($"progress: {completedCount:N0}/{totalIds:N0} checked, {freeCount} free, {rate:F0}/min, ETA: {estimatedTimeLeft:hh\\:mm\\:ss}", ConsoleColor.Yellow);
+                }
             }
-            catch (Exception ex)
-            {
-                count++;
-                WriteColor($"{id} - ", ConsoleColor.White);
-                WriteColorLine($"ERROR: {ex.Message}", ConsoleColor.Magenta);
-            }
+        });
 
-            if (count % 100 == 0)
-            {
-                var elapsed = DateTime.Now - start;
-                var rate = count / elapsed.TotalMinutes;
-                var remaining = totalIds - count;
-                var estimatedMinutesLeft = remaining / Math.Max(rate, 1);
-                var estimatedTimeLeft = TimeSpan.FromMinutes(estimatedMinutesLeft);
+        var tasks = allIds.Select(id => ProcessIdAsync(id, writer)).ToArray();
+        await Task.WhenAll(tasks);
 
-                WriteColorLine($"progress: {count:N0}/{totalIds:N0} checked, {free} free, {rate:F0}/min, ETA: {estimatedTimeLeft:hh\\:mm\\:ss}\n", ConsoleColor.Yellow);
-                await writer.FlushAsync();
-            }
-        }
+        await progressTask;
 
         var total = DateTime.Now - start;
-        string summary = $"\ncompleted: {count:N0} checked, {free} free IDs found in {total:hh\\:mm\\:ss}";
+        string summary = $"\ncompleted: {completedCount:N0} checked, {freeCount} free IDs found in {total:hh\\:mm\\:ss}";
         WriteColorLine(summary, ConsoleColor.Cyan);
         await writer.WriteLineAsync(summary);
     }
 
+    static async Task ProcessIdAsync(string id, StreamWriter writer)
+    {
+        await concurrencySemaphore.WaitAsync();
+        
+        try
+        {
+            bool isFree = await CheckId(id);
+            
+            string status = isFree ? "FREE" : "TAKEN";
+            ConsoleColor color = isFree ? ConsoleColor.Green : ConsoleColor.Red;
+
+            lock (lockObject)
+            {
+                WriteColor($"{id} - ", ConsoleColor.White);
+                WriteColorLine(status, color);
+            }
+
+            lock (writer)
+            {
+                writer.WriteLineAsync($"{id} - {status}").Wait();
+            }
+
+            lock (statsLock)
+            {
+                completedCount++;
+                if (isFree) freeCount++;
+            }
+        }
+        catch (Exception ex)
+        {
+            lock (lockObject)
+            {
+                WriteColor($"{id} - ", ConsoleColor.White);
+                WriteColorLine($"ERROR: {ex.Message}", ConsoleColor.Magenta);
+            }
+            
+            lock (statsLock)
+            {
+                completedCount++;
+            }
+        }
+        finally
+        {
+            concurrencySemaphore.Release();
+        }
+    }
+
     static void WriteColor(string text, ConsoleColor color)
     {
-        lock (lockObject)
-        {
-            var originalColor = Console.ForegroundColor;
-            Console.ForegroundColor = color;
-            Console.Write(text);
-            Console.ForegroundColor = originalColor;
-        }
+        var originalColor = Console.ForegroundColor;
+        Console.ForegroundColor = color;
+        Console.Write(text);
+        Console.ForegroundColor = originalColor;
     }
 
     static void WriteColorLine(string text, ConsoleColor color)
     {
-        lock (lockObject)
-        {
-            var originalColor = Console.ForegroundColor;
-            Console.ForegroundColor = color;
-            Console.WriteLine(text);
-            Console.ForegroundColor = originalColor;
-        }
+        var originalColor = Console.ForegroundColor;
+        Console.ForegroundColor = color;
+        Console.WriteLine(text);
+        Console.ForegroundColor = originalColor;
     }
 
     static int GetLength(string[] args)
@@ -146,7 +178,7 @@ class SteamIDChecker
 
     static IEnumerable<string> GenerateIds(int length, string startFrom = "")
     {
-        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
         var allIds = Generate("", length, chars);
         
         if (string.IsNullOrEmpty(startFrom))
@@ -189,7 +221,7 @@ class SteamIDChecker
         
         if (needToWait)
         {
-            await ShowCountdownAsync("waiting for rate limit", rateLimitWaitTime);
+            await Task.Delay(rateLimitWaitTime);
         }
 
         await RateLimit();
@@ -209,21 +241,20 @@ class SteamIDChecker
                 attempt++;
                 TimeSpan waitTime = GetRetryDelay(attempt);
                 
-                WriteColorLine($"rate limited #{attempt} - waiting {waitTime.TotalMinutes:F0}m {waitTime.Seconds}s...", ConsoleColor.DarkYellow);
-                await ShowCountdownAsync($"Rate limited (#{attempt})", waitTime);
+                WriteColorLine($"rate limited #{attempt} for {id} - waiting {waitTime.TotalMinutes:F0}m {waitTime.Seconds}s...", ConsoleColor.DarkYellow);
+                await Task.Delay(waitTime);
                 
                 continue;
             }
 
             var content = await response.Content.ReadAsStringAsync();
-
             return IsNotFound(content);
         }
     }
 
     static async Task RateLimit()
     {
-        await Task.Delay(1);
+        await Task.Delay(5);
 
         lock (lockObject)
         {
@@ -240,29 +271,6 @@ class SteamIDChecker
             3 => TimeSpan.FromMinutes(5),
             _ => TimeSpan.FromMinutes(10)
         };
-    }
-
-    static async Task ShowCountdownAsync(string message, TimeSpan duration)
-    {
-        var endTime = DateTime.Now.Add(duration);
-        
-        while (DateTime.Now < endTime)
-        {
-            var remaining = endTime - DateTime.Now;
-            if (remaining.TotalSeconds <= 0) break;
-            
-            lock (lockObject)
-            {
-                Console.Write($"\r{message} - resuming in: {remaining.TotalSeconds:F0}s");
-            }
-            
-            await Task.Delay(1000);
-        }
-        
-        lock (lockObject)
-        {
-            Console.Write($"\r{new string(' ', Console.WindowWidth - 1)}\r");
-        }
     }
 
     static bool IsNotFound(string xml)
